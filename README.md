@@ -37,8 +37,10 @@ SIGNATE開催コンペ「近赤外スペクトルから木材の含水率を予�
 │
 ├── eda_nirs.ipynb              # 探索的データ分析（EDA）
 ├── preprocessing.ipynb         # 前処理パイプライン
-├── learning.ipynb              # モデル学習・ハイパーパラメータ探索
-├── predicting.ipynb            # 予測・提出ファイル生成
+├── learning.ipynb              # モデル学習 v1（ベースライン）
+├── predicting.ipynb            # 予測・提出ファイル生成 v1
+├── learning_v2.ipynb           # モデル学習 v2（類似度特徴量あり）
+├── predicting_v2.ipynb         # 予測・提出ファイル生成 v2
 │
 ├── models/                     # 学習済みオブジェクトの保存先
 │   ├── pca.pkl                 # 学習済みPCA（testへの適用に使用）
@@ -46,7 +48,10 @@ SIGNATE開催コンペ「近赤外スペクトルから木材の含水率を予�
 │   ├── y_train.npy             # log変換済みtrain目的変数
 │   ├── X_test.npy              # 前処理済みtest特徴量
 │   ├── test_sample_numbers.npy # testのsample_number
-│   └── model.pkl               # 学習済みモデル
+│   ├── model.pkl               # 学習済みモデル v1
+│   ├── model_v2.pkl            # 学習済みモデル v2（類似度特徴量あり）
+│   ├── species_centroids.npy   # train各樹種の平均スペクトル（v2用）
+│   └── species_centroid_ids.npy# 樹種番号の対応表（v2用）
 │
 └── submission.csv              # 提出ファイル（最新）
 ```
@@ -65,7 +70,7 @@ eda_nirs.ipynb
 
 データの分布・スペクトルの可視化・含水率との相関分析を行います。モデル設計の根拠を確認したい場合に参照してください。
 
-### 2. 前処理
+### 2. 前処理（v1・v2 共通）
 
 ```
 preprocessing.ipynb
@@ -81,31 +86,51 @@ preprocessing.ipynb
 
 **重要**: PCAは必ずtrainデータだけで学習（`fit`）し、testには同じ変換を適用（`transform`）します。testで`fit`するとデータリークになります。
 
-### 3. モデル学習
+### 3a. モデル学習 v1（ベースライン）
 
 ```
-learning.ipynb
+learning.ipynb → predicting.ipynb
 ```
 
-Ridge回帰をGroupKFoldでバリデーションしながらalphaを探索し、最良のモデルをtrain全データで再学習して保存します。
+Ridge回帰をGroupKFold（**ベイスギ除外CV**）でバリデーションしながらalphaを探索し、最良のモデルをtrain全データで再学習して保存します。
 
-**バリデーション戦略**：通常のKFold（ランダム分割）ではなくGroupKFoldを使用。樹種単位で分割することで「学習していない樹種を予測する」という本番環境に近い評価ができます。
-
-### 4. 予測・提出ファイル生成
+### 3b. モデル学習 v2（類似度特徴量あり）
 
 ```
-predicting.ipynb
+learning_v2.ipynb → predicting_v2.ipynb
 ```
 
-`submission.csv` を生成します。提出フォーマット：ヘッダーなし・550行・1列目がsample_number・2列目が予測含水率。
+v1に加えて、trainの各樹種平均スペクトルとのユークリッド距離（13次元）を特徴量に追加します。PCA20次元 + 類似度13次元の計33次元でRidgeを学習します。
+
+**なぜ有効か**：testは未知樹種だが「trainのどの樹種に似ているか」という文脈情報を与えることで、似た樹種の傾向を参考にしながら予測できるようになるため。
+
+**ルール適合性**：基準点はtrainだけから作るので、testサンプル同士の情報は使わない。
 
 ---
 
-## 現在のモデル性能
+## CVの評価方針
 
-| モデル | 前処理 | CV RMSE |
-|---|---|---|
-| Ridge回帰（alpha=2000） | SNV + PCA（20次元） + log変換 | **25.35 ± 15.58** |
+### ベイスギ（樹種15）をCVから除外する理由
+
+PCA分析により、ベイスギのスペクトルは他の全樹種と大きく異なることが判明しました（PCA第1主成分が+9.7と突出）。一方、testの6樹種は全てPC1が-2〜0の範囲に収まっており、ベイスギのような外れた位置にいません。
+
+ベイスギを含めたCVはスコアが悪く見えすぎて改善の判断精度が下がるため、**CVはベイスギ除外・最終学習は全樹種込み**の方針を採用しています。
+
+| CV方針 | ベイスギ |
+|---|---|
+| CVスコアの計算（改善判断） | 除外する |
+| 最終モデルの学習 | 含める |
+
+---
+
+## 提出履歴
+
+| # | モデル | 前処理 | CV RMSE（ベイスギ除外） | public RMSE |
+|---|---|---|---|---|
+| 1 | Ridge（alpha=2000） | SNV + PCA 20次元 | - | 14.75 |
+| 2 | Ridge（alpha=2500） | SNV + PCA 20次元 | 19.00 ± 7.51 | 14.40 |
+| 3 | Ridge（alpha=1600） | SNV + PCA 20次元 | 18.52 ± 6.12 | 15.16 |
+| 4 | Ridge（alpha=1100） | SNV + PCA 20次元 + 類似度13次元 | 17.84 ± 6.29 | 17.64 |
 
 ---
 
@@ -116,24 +141,26 @@ predicting.ipynb
 - 7600 cm⁻¹付近の波数が含水率と最も相関が高い（r=0.78）→ 水のO-H伸縮振動の倍音帯
 - スペクトルのベースラインが樹種間でずれている → SNVで対応
 - **trainとtestで樹種が完全に分離** → 樹種番号を特徴量に使わない設計が必須
+- **ベイスギ（樹種15）のスペクトルが突出して特殊**（PC1=+9.7）→ CVから除外して評価精度を改善
 
 ---
 
 ## 今後の改善方針
 
-1. **微分前処理の追加**：Savitzky-Golay 1次微分を適用してベースラインの傾きを除去する
-2. **PCA次元数の見直し**：前処理が変わると最適次元も変わるため再チューニング
-3. **モデルのアップグレード**：LightGBMなど非線形モデルへの切り替えを検討
+1. **類似度特徴量の深掘り**：最近傍サンプルとの距離など類似度の種類を増やす
+2. **モデルのアップグレード**：LightGBMなど非線形モデルへの切り替えを検討
+3. **水分吸収帯への特化**：5200cm⁻¹・7000cm⁻¹付近に絞った特徴量設計
+4. **アンサンブル**：複数モデルの予測を組み合わせる（最終手段）
 
 ---
 
 ## 環境
 
 - Python 3.10
-- pandas, numpy, matplotlib, seaborn
+- pandas, numpy, matplotlib, seaborn, scipy
 - scikit-learn（Ridge, PCA, GroupKFold）
 - joblib
 
 ```bash
-pip install pandas numpy matplotlib seaborn scikit-learn joblib
+pip install pandas numpy matplotlib seaborn scikit-learn joblib scipy
 ```
