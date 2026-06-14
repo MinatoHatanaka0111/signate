@@ -10,4 +10,4 @@ wheels/
 .venv
 data/
 models/
-submission*.csv
+submission.csv
