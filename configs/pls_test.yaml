@@ -1,0 +1,29 @@
+# configs/pls_test.yaml
+# 動作確認用（探索範囲を最小限に絞っている）
+
+run_id: pls_test
+model_dir: models
+data_dir: data/
+
+cv:
+  n_splits: 5
+  use_log_y: false
+
+preprocessing:
+  scaler: snv
+  deriv: 2
+  window: 11
+  polyorder: 2
+  use_osc: false
+  use_pca: false
+
+model:
+  model_type: pls
+  params:
+    n_components: 10
+
+search_params:
+  preprocessing:
+    window: [9, 13]
+  model:
+    n_components: [10, 20]

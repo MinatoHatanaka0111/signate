@@ -1,718 +1,738 @@
 """
 learning.py
 ===========
-近赤外スペクトル分析チャレンジ — 学習モジュール
+近赤外スペクトル分析チャレンジ — 学習モジュール（config駆動版）
 
-担当する処理:
-  1. GroupKFoldによるクロスバリデーション（CV）
-  2. 最適な成分数の探索
-  3. 全trainデータでの最終モデル学習
-  4. CV結果の詳細表示（樹種ごとのRMSEなど）
+使い方
+------
+    # グリッドサーチ → 最終モデル保存
+    python src/learning.py --config configs/pls_snv_deriv2.yaml
+
+    # LightGBM Optuna チューニング（グリッドサーチ上位N候補を最適化）
+    python src/learning.py --config configs/lgbm_snv_pca.yaml \
+                           --optimizer optuna --n_trials 100 --n_top 3
+
+    # 実験結果の一覧表示
+    python src/learning.py --show
+
+設計方針
+--------
+- config（YAML）で前処理・モデル・探索パラメータをすべて制御する
+- 前処理はすべて preprocessing.py の build_pipeline() 経由で行う
+- GroupKFold の各 fold 内で OSC/PCA を fit → valid に適用（リーク防止）
+- optimizer: grid  → グリッドサーチ（デフォルト）
+  optimizer: optuna → グリッドサーチで前処理を絞り込んだ後 Optuna でチューニング
+- 探索結果（全組み合わせの CV スコア）を JSON で保存する
+- 最良パラメータで全 train を学習したモデルを joblib で保存する
+- --show で models/ 以下の全実験結果を一覧表示する
 """
 
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+import sys
+import warnings
+from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
+import yaml
 from sklearn.cross_decomposition import PLSRegression
-from sklearn.model_selection import GroupKFold
 from sklearn.metrics import mean_squared_error
-import joblib
-import os
+from sklearn.model_selection import GroupKFold
 
-# 前処理モジュールを読み込む
-import sys
-sys.path.append("src")
-from preprocessing import (load_data, get_train_data,
-                           apply_snv, apply_savgol,
-                           fit_msc, apply_msc,
-                           fit_osc, apply_osc,
-                           apply_log_y, inverse_log_y)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+sys.path.insert(0, str(Path(__file__).parent))
+from preprocessing import (
+    load_data, fit_msc, build_pipeline,
+    apply_log_y, inverse_log_y,
+)
 
 
 # ============================================================
 # 評価指標
 # ============================================================
 
-def rmse(y_true, y_pred):
-    """RMSE（平均二乗誤差の平方根）を計算する。小さいほど良い。"""
-    return np.sqrt(mean_squared_error(y_true, y_pred))
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
 # ============================================================
-# GroupKFold クロスバリデーション
+# 1 fold 分の学習・予測
 # ============================================================
 
-def cross_validate_pls(X, y, groups, n_components,
-                       n_splits=5, use_log_y=False):
+def _fit_predict_fold(X_tr, y_tr, X_val, y_val,
+                      model_cfg: dict, use_log_y: bool) -> tuple[np.ndarray, object]:
     """
-    GroupKFoldでPLSのCVスコアを計算する。
+    1 fold 分の学習と予測を行い (予測値, 学習済みモデル) を返す。
 
-    GroupKFoldを使う理由:
-        trainとtestで樹種が完全に分かれているため、
-        validationにも学習していない樹種を使わないと
-        実際の提出スコアとの乖離が大きくなる。
+    予測値は元のスケール・0以上にクリップ済み。
+    SVR のみ (StandardScaler, SVR) の tuple として返す。
+    """
+    model_type = model_cfg["model_type"]
+    params     = model_cfg.get("params", {})
+    y_tr_fit   = apply_log_y(y_tr) if use_log_y else y_tr
 
-    Parameters
-    ----------
-    X            : np.ndarray  前処理済みスペクトル
-    y            : np.ndarray  含水率（元のスケール）
-    groups       : np.ndarray  樹種番号（fold分割の基準）
-    n_components : int         PLSの成分数
-    n_splits     : int         fold数（樹種数13に対して5が妥当）
-    use_log_y    : bool        Trueのとき含水率をlog変換してから学習する
+    if model_type == "pls":
+        model = PLSRegression(n_components=params.get("n_components", 10),
+                              scale=False)
+        model.fit(X_tr, y_tr_fit)
+        y_pred = model.predict(X_val).flatten()
 
-    Returns
-    -------
-    cv_rmse      : float       全foldのRMSE平均（元のスケール）
-    fold_results : list[dict]  各foldの詳細結果
+    elif model_type == "lgbm":
+        import lightgbm as lgb
+        lgbm_params = {
+            "n_estimators":      params.get("n_estimators", 1000),
+            "learning_rate":     params.get("learning_rate", 0.05),
+            "num_leaves":        params.get("num_leaves", 31),
+            "max_depth":         params.get("max_depth", -1),
+            "min_child_samples": params.get("min_child_samples", 20),
+            "subsample":         params.get("subsample", 0.8),
+            "colsample_bytree":  params.get("colsample_bytree", 0.8),
+            "colsample_bylevel": params.get("colsample_bylevel", 1.0),
+            "reg_lambda":        params.get("reg_lambda", 1.0),
+            "reg_alpha":         params.get("reg_alpha", 0.0),
+            "random_state":      params.get("random_state", 42),
+            "verbose":           -1,
+        }
+        model = lgb.LGBMRegressor(**lgbm_params)
+        model.fit(X_tr, y_tr_fit,
+                  eval_set=[(X_val, apply_log_y(y_val) if use_log_y else y_val)],
+                  callbacks=[lgb.early_stopping(50, verbose=False),
+                             lgb.log_evaluation(period=-1)])
+        y_pred = model.predict(X_val)
+
+    elif model_type == "ridge":
+        from sklearn.linear_model import Ridge
+        model = Ridge(alpha=params.get("alpha", 1.0))
+        model.fit(X_tr, y_tr_fit)
+        y_pred = model.predict(X_val)
+
+    elif model_type == "svr":
+        from sklearn.svm import SVR
+        from sklearn.preprocessing import StandardScaler
+        sc = StandardScaler()
+        X_tr_sc  = sc.fit_transform(X_tr)
+        X_val_sc = sc.transform(X_val)
+        inner = SVR(C=params.get("C", 1.0),
+                    epsilon=params.get("epsilon", 0.1),
+                    kernel=params.get("kernel", "rbf"),
+                    gamma=params.get("gamma", "scale"))
+        inner.fit(X_tr_sc, y_tr_fit)
+        y_pred = inner.predict(X_val_sc)
+        model  = (sc, inner)
+
+    else:
+        raise ValueError(f"未対応のモデル: {model_type}")
+
+    if use_log_y:
+        y_pred = inverse_log_y(y_pred)
+    y_pred = np.clip(y_pred, 0, None)
+    return y_pred, model
+
+
+# ============================================================
+# GroupKFold CV（汎用）
+# ============================================================
+
+def cross_validate(X_raw: np.ndarray,
+                   y: np.ndarray,
+                   groups: np.ndarray,
+                   prep_cfg: dict,
+                   model_cfg: dict,
+                   ref_spectrum: np.ndarray,
+                   n_splits: int = 5,
+                   use_log_y: bool = False) -> tuple[float, list[dict]]:
+    """
+    GroupKFold でクロスバリデーションを行い CV-RMSE と詳細結果を返す。
+
+    OSC / PCA は各 fold の train データのみで fit し、
+    同 fold の valid に適用する（データリーク防止）。
     """
     gkf = GroupKFold(n_splits=n_splits)
     fold_results = []
 
-    for fold_idx, (train_idx, valid_idx) in enumerate(
-            gkf.split(X, y, groups=groups)):
+    for fold_idx, (tr_idx, val_idx) in enumerate(
+            gkf.split(X_raw, y, groups=groups)):
 
-        X_tr, X_val = X[train_idx], X[valid_idx]
-        y_tr, y_val = y[train_idx], y[valid_idx]
-        groups_val  = groups[valid_idx]
+        X_tr_raw, X_val_raw = X_raw[tr_idx], X_raw[val_idx]
+        y_tr, y_val         = y[tr_idx], y[val_idx]
+        groups_val          = groups[val_idx]
 
-        # log変換（学習時のみ適用）
-        y_tr_fit = apply_log_y(y_tr) if use_log_y else y_tr
+        X_tr, saved_params = build_pipeline(
+            X_tr_raw, y_tr, prep_cfg, ref_spectrum, fit_mode=True)
+        X_val, _ = build_pipeline(
+            X_val_raw, y_val, prep_cfg, ref_spectrum,
+            fit_mode=False, saved_params=saved_params)
 
-        # PLSモデルの学習
-        pls = PLSRegression(n_components=n_components, scale=False)
-        pls.fit(X_tr, y_tr_fit)
+        y_pred, model = _fit_predict_fold(
+            X_tr, y_tr, X_val, y_val, model_cfg, use_log_y)
 
-        # 予測
-        y_pred = pls.predict(X_val).flatten()
-
-        # log変換した場合は逆変換で元のスケールに戻す
-        if use_log_y:
-            y_pred = inverse_log_y(y_pred)
-
-        # 含水率は0以上のため負の予測値を0にクリップ
-        y_pred = np.clip(y_pred, 0, None)
-
-        # RMSEは元のスケールで計算（提出スコアと同じ基準）
-        fold_rmse = rmse(y_val, y_pred)
-
-        # このfoldに含まれる樹種ごとのRMSEも計算
-        species_rmse = {}
-        for sp in np.unique(groups_val):
-            mask = groups_val == sp
-            species_rmse[int(sp)] = rmse(y_val[mask], y_pred[mask])
+        fold_rmse    = rmse(y_val, y_pred)
+        species_rmse = {
+            str(int(sp)): rmse(y_val[groups_val == sp], y_pred[groups_val == sp])
+            for sp in np.unique(groups_val)
+        }
+        extra = {}
+        if hasattr(model, "best_iteration_"):
+            extra["best_iteration"] = model.best_iteration_
 
         fold_results.append({
-            "fold":        fold_idx + 1,
-            "rmse":        fold_rmse,
-            "n_valid":     len(y_val),
+            "fold":         fold_idx + 1,
+            "rmse":         fold_rmse,
+            "n_valid":      int(len(y_val)),
             "species_rmse": species_rmse,
+            **extra,
         })
 
-    cv_rmse = np.mean([r["rmse"] for r in fold_results])
+    cv_rmse = float(np.mean([r["rmse"] for r in fold_results]))
     return cv_rmse, fold_results
 
 
 # ============================================================
-# 最適成分数の探索
+# グリッドサーチ
 # ============================================================
 
-def search_best_n_components(X, y, groups,
-                              candidates=None, n_splits=5):
-    """
-    成分数を変えながらCVを繰り返し、最良の成分数を探す。
+def _expand_grid(search_params: dict) -> list[dict]:
+    """search_params のリストを総当たり展開してパラメータ組み合わせリストを返す。"""
+    keys_prep  = list(search_params.get("preprocessing", {}).keys())
+    vals_prep  = [search_params["preprocessing"][k] for k in keys_prep]
+    keys_model = list(search_params.get("model", {}).keys())
+    vals_model = [search_params["model"][k] for k in keys_model]
 
-    Parameters
-    ----------
-    candidates : list[int]  試す成分数のリスト
-                            Noneのとき [2,4,6,8,10,12,15,20,25,30] を使う
+    all_keys = keys_prep + keys_model
+    all_vals = vals_prep + vals_model
+
+    if not all_vals:
+        return [{"preprocessing": {}, "model": {}}]
+
+    grid = []
+    for combo in itertools.product(*all_vals):
+        flat = dict(zip(all_keys, combo))
+        grid.append({
+            "preprocessing": {k: flat[k] for k in keys_prep},
+            "model":         {k: flat[k] for k in keys_model},
+        })
+    return grid
+
+
+def grid_search(X_raw: np.ndarray,
+                y: np.ndarray,
+                groups: np.ndarray,
+                base_cfg: dict,
+                ref_spectrum: np.ndarray) -> tuple[dict, list[dict]]:
+    """
+    config の search_params に従ってグリッドサーチを行う。
 
     Returns
     -------
-    best_n     : int        最良の成分数
-    search_log : list[dict] 各成分数のCVスコア
+    best_cfg   : dict         最良の組み合わせ（prep + model パラメータ上書き済み）
+    search_log : list[dict]   全組み合わせの結果（CV-RMSE 昇順）
     """
-    if candidates is None:
-        candidates = [2, 4, 6, 8, 10, 12, 15, 20, 25, 30]
+    n_splits  = base_cfg.get("cv", {}).get("n_splits", 5)
+    use_log_y = base_cfg.get("cv", {}).get("use_log_y", False)
+    base_prep  = dict(base_cfg.get("preprocessing", {}))
+    base_model = dict(base_cfg.get("model", {}))
 
-    print(f"\n{'='*50}")
-    print(f"成分数の探索 (GroupKFold, n_splits={n_splits})")
-    print(f"{'='*50}")
-    print(f"{'成分数':>6}  {'CV-RMSE':>10}")
-    print(f"{'-'*20}")
+    grid  = _expand_grid(base_cfg.get("search_params", {}))
+    total = len(grid)
+
+    print(f"\n{'='*65}")
+    print(f"グリッドサーチ: {total} 組み合わせ  "
+          f"model={base_model.get('model_type')}  "
+          f"folds={n_splits}  log_y={use_log_y}")
+    print(f"{'='*65}")
 
     search_log = []
-    best_rmse = np.inf
-    best_n    = candidates[0]
+    best_rmse  = np.inf
+    best_cfg   = None
 
-    for n in candidates:
-        cv_rmse, _ = cross_validate_pls(X, y, groups,
-                                         n_components=n,
-                                         n_splits=n_splits)
-        search_log.append({"n_components": n, "cv_rmse": cv_rmse})
-        marker = " ← 現時点の最良" if cv_rmse < best_rmse else ""
-        print(f"{n:>6}  {cv_rmse:>10.4f}{marker}")
+    for i, combo in enumerate(grid, 1):
+        prep_cfg  = {**base_prep,  **combo["preprocessing"]}
+        model_cfg = {**base_model, "params": {
+            **base_model.get("params", {}), **combo["model"]}}
+
+        try:
+            cv_rmse, fold_results = cross_validate(
+                X_raw, y, groups, prep_cfg, model_cfg,
+                ref_spectrum, n_splits, use_log_y)
+        except Exception as e:
+            print(f"  [{i:>4}/{total}] ERROR: {e}")
+            continue
+
+        marker = " ← best" if cv_rmse < best_rmse else ""
+        print(f"  [{i:>4}/{total}]  CV-RMSE={cv_rmse:.4f}{marker}  "
+              f"prep={combo['preprocessing']}  model={combo['model']}")
+
+        search_log.append({
+            "rank": None, "cv_rmse": cv_rmse,
+            "preprocessing": prep_cfg, "model": model_cfg,
+            "fold_results": fold_results,
+        })
 
         if cv_rmse < best_rmse:
             best_rmse = cv_rmse
-            best_n    = n
+            best_cfg  = {"preprocessing": prep_cfg, "model": model_cfg,
+                         "cv_rmse": cv_rmse}
 
-    print(f"\n最良の成分数: {best_n}  (CV-RMSE: {best_rmse:.4f})")
-    return best_n, search_log
+    search_log.sort(key=lambda x: x["cv_rmse"])
+    for rank, e in enumerate(search_log, 1):
+        e["rank"] = rank
+
+    print(f"\n最良: CV-RMSE={best_rmse:.4f}")
+    print(f"  前処理: {best_cfg['preprocessing']}")
+    print(f"  モデル: {best_cfg['model']}")
+    return best_cfg, search_log
 
 
 # ============================================================
-# window_length × n_components の総当たり探索
+# Optuna チューニング（LightGBM 専用）
 # ============================================================
 
-def search_best_params(train_raw, y, groups, spec_cols,
-                       window_candidates=None,
-                       n_comp_candidates=None,
-                       n_splits=5,
-                       scaler="snv",
-                       use_log_y=False,
-                       ref_spectrum=None,
-                       deriv=2):
+def _optuna_tune(X_raw: np.ndarray,
+                 y: np.ndarray,
+                 groups: np.ndarray,
+                 prep_cfg: dict,
+                 ref_spectrum: np.ndarray,
+                 n_trials: int = 100,
+                 n_splits: int = 5,
+                 use_log_y: bool = False) -> tuple[dict, float]:
     """
-    window_length × n_components を総当たりで探索し最良の組み合わせを返す。
+    指定の前処理設定で LightGBM の Optuna チューニングを実行する。
 
-    Parameters
-    ----------
-    train_raw        : np.ndarray  生スペクトル (n_samples, n_wavelengths)
-    y                : np.ndarray  含水率（元のスケール）
-    groups           : np.ndarray  樹種番号
-    spec_cols        : list[str]   波数列名（表示用）
-    window_candidates: list[int]   試すwindow_lengthのリスト
-    n_comp_candidates: list[int]   試すn_componentsのリスト
-    n_splits         : int         GroupKFoldのfold数
-    scaler           : str         "snv" または "msc"
-    use_log_y        : bool        Trueのとき含水率をlog変換して学習
-    ref_spectrum     : np.ndarray  MSC用の基準スペクトル（scaler="msc"のとき必須）
-    deriv            : int         微分の次数（0=微分なし、1=1次微分、2=2次微分）
-                                   deriv=0のときwindow_candidatesは無視される
+    fold 内前処理を事前計算してキャッシュし、Optuna の各 trial では
+    モデル学習のみ行うことで高速化している。
 
     Returns
     -------
-    best_params : dict  {"window_length": int or None, "n_components": int}
-    search_log  : list[dict]  全組み合わせのCVスコア
+    best_params : dict   最良の LightGBM パラメータ
+    best_rmse   : float  最良の CV-RMSE
     """
-    if n_comp_candidates is None:
-        n_comp_candidates = [2, 4, 6, 8, 10, 12, 15, 20, 25, 30]
-
-    # deriv=0（微分なし）のときはwindowループが不要
-    # window_candidatesをNoneにして分岐で処理する
-    if deriv == 0:
-        window_loop = [None]  # windowなしで1回だけループ
-    else:
-        if window_candidates is None:
-            window_candidates = [5, 7, 11, 15, 21]
-        window_loop = window_candidates
-
-    total = len(window_loop) * len(n_comp_candidates)
-    log_label   = " + log(y)" if use_log_y else ""
-    deriv_label = "微分なし" if deriv == 0 else f"{deriv}次微分"
-    print(f"\n{'='*60}")
-    print(f"パラメータ探索: {scaler.upper()} + {deriv_label}{log_label} "
-          f"(GroupKFold, n_splits={n_splits})")
-    if deriv == 0:
-        print(f"組み合わせ数: {len(n_comp_candidates)}通り（windowなし）")
-        print(f"{'n_comp':>8}  {'CV-RMSE':>10}")
-        print(f"{'-'*20}")
-    else:
-        print(f"組み合わせ数: {len(window_loop)} × "
-              f"{len(n_comp_candidates)} = {total}通り")
-        print(f"{'window':>8}  {'n_comp':>8}  {'CV-RMSE':>10}")
-        print(f"{'-'*30}")
-
-    search_log  = []
-    best_rmse   = np.inf
-    best_params = {"window_length": window_loop[0],
-                   "n_components":  n_comp_candidates[0]}
-
-    for window in window_loop:
-        # スケーリング（SNV or MSC）を適用
-        if scaler == "snv":
-            X_scaled = apply_snv(train_raw)
-        elif scaler == "msc":
-            if ref_spectrum is None:
-                raise ValueError("scaler='msc'のときref_spectrumが必要です")
-            X_scaled = apply_msc(train_raw, ref_spectrum)
-        else:
-            raise ValueError(f"scalerは'snv'か'msc'を指定してください: {scaler}")
-
-        # 微分を適用（deriv=0のときはスキップ）
-        X = apply_savgol(X_scaled, window_length=window, deriv=deriv) \
-            if deriv > 0 else X_scaled
-
-        for n_comp in n_comp_candidates:
-            cv_rmse, _ = cross_validate_pls(
-                X, y, groups,
-                n_components=n_comp,
-                n_splits=n_splits,
-                use_log_y=use_log_y
-            )
-            search_log.append({
-                "window_length": window,
-                "n_components":  n_comp,
-                "cv_rmse":       cv_rmse,
-            })
-
-            marker = " ← 現時点の最良" if cv_rmse < best_rmse else ""
-            if deriv == 0:
-                print(f"{n_comp:>8}  {cv_rmse:>10.4f}{marker}")
-            else:
-                print(f"{window:>8}  {n_comp:>8}  {cv_rmse:>10.4f}{marker}")
-
-            if cv_rmse < best_rmse:
-                best_rmse = cv_rmse
-                best_params = {"window_length": window,
-                               "n_components":  n_comp}
-
-    if deriv == 0:
-        print(f"\n最良の成分数: {best_params['n_components']}  "
-              f"(CV-RMSE: {best_rmse:.4f})")
-    else:
-        print(f"\n最良の組み合わせ: window={best_params['window_length']}, "
-              f"n_components={best_params['n_components']}  "
-              f"(CV-RMSE: {best_rmse:.4f})")
-    return best_params, search_log
-
-
-# ============================================================
-# 最終モデルの学習（全trainデータを使う）
-# ============================================================
-
-def train_final_model(X, y, n_components,
-                      save_path="pls_model.pkl",
-                      use_log_y=False):
-    """
-    最適な成分数で全trainデータを使ってPLSを学習し、モデルを保存する。
-
-    Parameters
-    ----------
-    X            : np.ndarray  全trainスペクトル
-    y            : np.ndarray  全train含水率（元のスケール）
-    n_components : int         最適成分数
-    save_path    : str         モデルの保存先
-    use_log_y    : bool        Trueのとき含水率をlog変換して学習する
-
-    Returns
-    -------
-    model : PLSRegression  学習済みモデル
-    """
-    y_fit = apply_log_y(y) if use_log_y else y
-
-    model = PLSRegression(n_components=n_components, scale=False)
-    model.fit(X, y_fit)
-
-    save_dir = os.path.dirname(save_path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-    joblib.dump(model, save_path)
-    print(f"\n[train_final_model] 学習完了: 成分数={n_components}, "
-          f"log変換={'あり' if use_log_y else 'なし'}")
-    print(f"[train_final_model] モデルを保存: {save_path}")
-
-    return model
-
-
-# ============================================================
-# CV結果の詳細表示
-# ============================================================
-
-def print_cv_detail(fold_results, train):
-    """
-    CVの詳細結果を表示する。
-    樹種ごとのRMSEを見ることで、どの樹種が難しいかがわかる。
-    """
-    # 樹種番号 → 樹種名のマッピング
-    sp_name_map = dict(zip(train["species_number"], train["species_name"]))
-
-    print(f"\n{'='*55}")
-    print("樹種ごとのCV-RMSE（validationに出現したfoldの平均）")
-    print(f"{'='*55}")
-
-    # 樹種ごとにRMSEをまとめる
-    sp_rmse_all = {}
-    for fold in fold_results:
-        for sp, r in fold["species_rmse"].items():
-            sp_rmse_all.setdefault(sp, []).append(r)
-
-    print(f"{'樹種番号':>6}  {'樹種名':<12}  {'RMSE':>8}  {'出現fold数':>6}")
-    print(f"{'-'*40}")
-    for sp in sorted(sp_rmse_all.keys()):
-        rmse_list = sp_rmse_all[sp]
-        mean_rmse = np.mean(rmse_list)
-        name = sp_name_map.get(sp, "不明")
-        print(f"{sp:>6}  {name:<12}  {mean_rmse:>8.4f}  {len(rmse_list):>6}")
-
-
-# ============================================================
-# 第2段階探索用の候補リスト生成
-# ============================================================
-
-def make_fine_candidates(best_value, margin, step=1, min_val=1):
-    """
-    best_valueを中心にmargin分前後の候補リストを生成する。
-
-    第2段階探索で「第1段階の最良値の周辺を細かく探索する」ために使う。
-
-    Parameters
-    ----------
-    best_value : int  第1段階で得られた最良値
-    margin     : int  前後いくつ探索するか
-    step       : int  刻み幅（デフォルト1）
-    min_val    : int  候補の最小値（デフォルト1）
-
-    Returns
-    -------
-    candidates : list[int]
-
-    例: best_value=15, margin=3, step=1
-        → [12, 13, 14, 15, 16, 17, 18]
-    """
-    start = max(min_val, best_value - margin)
-    stop  = best_value + margin + 1
-    return list(range(start, stop, step))
-
-
-# ============================================================
-# OSC + window_length × n_components の総当たり探索
-# ============================================================
-
-def search_best_params_with_osc(train_raw, y, groups, spec_cols,
-                                 window_candidates=None,
-                                 n_comp_candidates=None,
-                                 n_comp_osc_candidates=None,
-                                 n_splits=5,
-                                 scaler="snv",
-                                 ref_spectrum=None,
-                                 deriv=2):
-    """
-    n_comp_osc × window_length × n_components を総当たり探索する。
-
-    OSCのfit（補正パラメータ計算）はtrainデータ全体を使うため、
-    GroupKFoldの各foldで再計算する必要がある点に注意。
-
-    具体的には:
-        各fold内のtrainデータでfit_osc → そのfoldのtrain/validに適用
-        → PLSを学習 → validで評価
-
-    Parameters
-    ----------
-    train_raw           : np.ndarray  生スペクトル
-    y                   : np.ndarray  含水率
-    groups              : np.ndarray  樹種番号
-    spec_cols           : list[str]   波数列名（表示用）
-    window_candidates   : list[int]   試すwindow_lengthのリスト
-    n_comp_candidates   : list[int]   試すPLSのn_componentsのリスト
-    n_comp_osc_candidates: list[int]  試すOSCのn_componentsのリスト
-    n_splits            : int         GroupKFoldのfold数
-    scaler              : str         "snv" または "msc"
-    ref_spectrum        : np.ndarray  MSC用の基準スペクトル
-    deriv               : int         微分の次数（1または2）
-
-    Returns
-    -------
-    best_params : dict  {"window_length", "n_components", "n_components_osc"}
-    search_log  : list[dict]
-    """
-    if window_candidates is None:
-        window_candidates = [5, 7, 11, 15, 21]
-    if n_comp_candidates is None:
-        n_comp_candidates = [2, 5, 10, 15, 20, 25, 30]
-    if n_comp_osc_candidates is None:
-        n_comp_osc_candidates = [1, 2, 3, 4, 5]
-
-    # deriv=0（微分なし）のときwindowループは不要
-    window_loop = [None] if deriv == 0 else window_candidates
-
-    total = (len(window_loop) * len(n_comp_osc_candidates)
-             * len(n_comp_candidates))
-    deriv_label = "微分なし" if deriv == 0 else f"{deriv}次微分"
-    print(f"\n{'='*65}")
-    print(f"OSCパラメータ探索: {scaler.upper()} + {deriv_label} + OSC "
-          f"(GroupKFold, n_splits={n_splits})")
-    if deriv == 0:
-        print(f"組み合わせ数: {len(n_comp_osc_candidates)} × "
-              f"{len(n_comp_candidates)} = {total}通り（windowなし）")
-        print(f"{'osc':>5}  {'n_comp':>8}  {'CV-RMSE':>10}")
-    else:
-        print(f"組み合わせ数: {len(window_loop)} × "
-              f"{len(n_comp_osc_candidates)} × "
-              f"{len(n_comp_candidates)} = {total}通り")
-        print(f"{'window':>8}  {'osc':>5}  {'n_comp':>8}  {'CV-RMSE':>10}")
-    print(f"{'-'*35}")
-
-    search_log  = []
-    best_rmse   = np.inf
-    best_params = {
-        "window_length":    window_loop[0],
-        "n_components_osc": n_comp_osc_candidates[0],
-        "n_components":     n_comp_candidates[0],
-    }
+    import optuna
+    import lightgbm as lgb
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     gkf = GroupKFold(n_splits=n_splits)
+    fold_data = []
+    for tr_idx, val_idx in gkf.split(X_raw, y, groups=groups):
+        X_tr_raw, X_val_raw = X_raw[tr_idx], X_raw[val_idx]
+        y_tr, y_val = y[tr_idx], y[val_idx]
+        X_tr, saved_p = build_pipeline(
+            X_tr_raw, y_tr, prep_cfg, ref_spectrum, fit_mode=True)
+        X_val, _ = build_pipeline(
+            X_val_raw, y_val, prep_cfg, ref_spectrum,
+            fit_mode=False, saved_params=saved_p)
+        fold_data.append((
+            X_tr, X_val,
+            apply_log_y(y_tr)  if use_log_y else y_tr,
+            y_val,
+        ))
 
-    for window in window_loop:
-        # スケーリング（SNV or MSC）を適用
-        if scaler == "snv":
-            X_scaled = apply_snv(train_raw)
-        else:
-            X_scaled = apply_msc(train_raw, ref_spectrum)
+    def objective(trial):
+        params = {
+            "num_leaves":        trial.suggest_int("num_leaves", 5, 100),
+            "max_depth":         trial.suggest_int("max_depth", 3, 8),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
+            "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.3, 1.0),
+            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.3, 1.0),
+            "reg_lambda":        trial.suggest_float("reg_lambda", 1e-3, 100.0, log=True),
+            "reg_alpha":         trial.suggest_float("reg_alpha",  1e-3, 100.0, log=True),
+            "n_estimators": 1000, "learning_rate": 0.05,
+            "random_state": 42,   "verbose": -1,
+        }
+        fold_rmses = []
+        for X_tr, X_val, y_tr_fit, y_val in fold_data:
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X_tr, y_tr_fit,
+                      eval_set=[(X_val, y_tr_fit)],
+                      callbacks=[lgb.early_stopping(50, verbose=False),
+                                 lgb.log_evaluation(period=-1)])
+            y_pred = np.clip(model.predict(X_val), 0, None)
+            if use_log_y:
+                y_pred = inverse_log_y(y_pred)
+            fold_rmses.append(rmse(y_val, y_pred))
+        return float(np.mean(fold_rmses))
 
-        # 微分を適用（deriv=0のときはスキップ）
-        X_diff = apply_savgol(X_scaled, window_length=window, deriv=deriv) \
-            if deriv > 0 else X_scaled
+    study = optuna.create_study(direction="minimize")
 
-        for n_osc in n_comp_osc_candidates:
-            # OSCはfold内のtrainで毎回fit → valid/trainに適用
-            fold_rmse_list = []
-            for train_idx, valid_idx in gkf.split(X_diff, y, groups=groups):
-                X_tr, X_val = X_diff[train_idx], X_diff[valid_idx]
-                y_tr, y_val = y[train_idx], y[valid_idx]
+    def _progress(study, trial):
+        if (trial.number + 1) % 20 == 0:
+            print(f"    trial {trial.number+1:>4}: "
+                  f"CV-RMSE={trial.value:.4f}  best={study.best_value:.4f}")
 
-                # fold内trainでOSCをfit
-                osc_params = fit_osc(X_tr, y_tr, n_components=n_osc)
+    study.optimize(objective, n_trials=n_trials, callbacks=[_progress])
 
-                # fold内train/validにOSCを適用
-                X_tr_osc  = apply_osc(X_tr,  osc_params)
-                X_val_osc = apply_osc(X_val, osc_params)
+    best_params = {**study.best_params,
+                   "n_estimators": 1000, "learning_rate": 0.05,
+                   "random_state": 42,   "verbose": -1}
 
-                fold_rmse_list.append((y_tr, y_val, X_tr_osc, X_val_osc,
-                                       groups[valid_idx]))
+    print(f"  → Optuna 完了: CV-RMSE={study.best_value:.4f}")
+    for k, v in study.best_params.items():
+        print(f"     {k}: {v}")
 
-            for n_comp in n_comp_candidates:
-                fold_rmses = []
-                for y_tr, y_val, X_tr_osc, X_val_osc, groups_val \
-                        in fold_rmse_list:
-                    pls = PLSRegression(n_components=n_comp, scale=False)
-                    pls.fit(X_tr_osc, y_tr)
-                    y_pred = np.clip(pls.predict(X_val_osc).flatten(), 0, None)
-                    fold_rmses.append(rmse(y_val, y_pred))
-
-                cv_rmse = np.mean(fold_rmses)
-                search_log.append({
-                    "window_length":    window,
-                    "n_components_osc": n_osc,
-                    "n_components":     n_comp,
-                    "cv_rmse":          cv_rmse,
-                })
-
-                marker = " ← 現時点の最良" if cv_rmse < best_rmse else ""
-                if deriv == 0:
-                    print(f"{n_osc:>5}  {n_comp:>8}  "
-                          f"{cv_rmse:>10.4f}{marker}")
-                else:
-                    print(f"{window:>8}  {n_osc:>5}  {n_comp:>8}  "
-                          f"{cv_rmse:>10.4f}{marker}")
-
-                if cv_rmse < best_rmse:
-                    best_rmse = cv_rmse
-                    best_params = {
-                        "window_length":    window,
-                        "n_components_osc": n_osc,
-                        "n_components":     n_comp,
-                    }
-
-    print(f"\n最良: window={best_params['window_length']}, "
-          f"osc={best_params['n_components_osc']}, "
-          f"n_comp={best_params['n_components']}  "
-          f"(CV-RMSE: {best_rmse:.4f})")
-    return best_params, search_log
+    return best_params, study.best_value
 
 
-# ============================================================
-# メイン実行
-# ============================================================
+def optuna_search(X_raw: np.ndarray,
+                  y: np.ndarray,
+                  groups: np.ndarray,
+                  base_cfg: dict,
+                  ref_spectrum: np.ndarray,
+                  n_trials: int = 100,
+                  n_top: int = 3) -> tuple[dict, list[dict]]:
+    """
+    Phase 1（グリッドサーチで前処理を絞り込み）→
+    Phase 2（上位 n_top 候補を Optuna で LightGBM チューニング）
 
-if __name__ == "__main__":
-    # --- データ読み込み ---
-    train, test, sample_sub, spec_cols = load_data()
+    Returns
+    -------
+    best_cfg   : dict         最良設定（前処理 + 最適化済み LightGBM パラメータ）
+    search_log : list[dict]   Phase 2 の全候補の結果
+    """
+    n_splits  = base_cfg.get("cv", {}).get("n_splits", 5)
+    use_log_y = base_cfg.get("cv", {}).get("use_log_y", False)
 
-    X_raw  = train[spec_cols].values
-    y      = train["moisture_content"].values
-    groups = train["species_number"].values
-
-    # MSC用の基準スペクトルをtrainから計算
-    ref_spectrum = fit_msc(X_raw)
-
-    # 探索候補
-    N_COMP_COARSE    = [2, 5, 8, 10, 15, 20, 25, 30]
-    N_OSC_COARSE     = [1, 2, 3, 4, 5]
-
-    results_summary = []
-
-    # ============================================================
-    # run_017: MSCのみ（微分なし・OSCなし）
-    # ============================================================
+    # --- Phase 1: 前処理スクリーニング ---
     print(f"\n{'#'*65}")
-    print("# run_017: MSC のみ（微分なし・OSCなし）")
+    print("# Phase 1: グリッドサーチ（前処理スクリーニング）")
     print(f"{'#'*65}")
-    best_1, _ = search_best_params(
-        X_raw, y, groups, spec_cols,
-        n_comp_candidates=N_COMP_COARSE,
-        n_splits=5, scaler="msc",
-        ref_spectrum=ref_spectrum, deriv=0
-    )
-    n_cands = make_fine_candidates(best_1["n_components"], margin=4, min_val=2)
-    best_2, _ = search_best_params(
-        X_raw, y, groups, spec_cols,
-        n_comp_candidates=n_cands,
-        n_splits=5, scaler="msc",
-        ref_spectrum=ref_spectrum, deriv=0
-    )
-    X_msc = apply_msc(X_raw, ref_spectrum)
-    cv_rmse, fold_results = cross_validate_pls(
-        X_msc, y, groups, n_components=best_2["n_components"], n_splits=5
-    )
-    print(f"\nrun_017 最終結果: MSCのみ, n_comp={best_2['n_components']}, CV-RMSE={cv_rmse:.4f}")
-    print_cv_detail(fold_results, train)
-    results_summary.append({
-        "run_id": "017", "scaler": "msc", "deriv": 0,
-        "use_osc": False, "use_log_y": False,
-        "window_length": None, "n_components_osc": None,
-        "n_components": best_2["n_components"], "cv_rmse": cv_rmse,
-    })
+    _, phase1_log = grid_search(X_raw, y, groups, base_cfg, ref_spectrum)
+    top_candidates = phase1_log[:n_top]
 
-    # ============================================================
-    # run_018・019: 微分なし + OSC
-    # ============================================================
-    for run_id, scaler in [("018", "snv"), ("019", "msc")]:
-        ref = ref_spectrum if scaler == "msc" else None
-        print(f"\n{'#'*65}")
-        print(f"# run_{run_id}: {scaler.upper()} + OSC（微分なし）")
-        print(f"{'#'*65}")
+    print(f"\nPhase 2 対象（上位 {n_top} 候補）:")
+    for i, c in enumerate(top_candidates, 1):
+        print(f"  [{i}] CV-RMSE={c['cv_rmse']:.4f}  prep={c['preprocessing']}")
 
-        # 第1段階
-        print("\n【第1段階】粗い探索")
-        best_1, _ = search_best_params_with_osc(
-            X_raw, y, groups, spec_cols,
-            n_comp_candidates=N_COMP_COARSE,
-            n_comp_osc_candidates=N_OSC_COARSE,
-            n_splits=5, scaler=scaler,
-            ref_spectrum=ref, deriv=0
-        )
+    # --- Phase 2: Optuna チューニング ---
+    print(f"\n{'#'*65}")
+    print(f"# Phase 2: Optuna チューニング (n_trials={n_trials})")
+    print(f"{'#'*65}")
 
-        # 第2段階
-        print("\n【第2段階】細かい探索")
-        osc_cands = make_fine_candidates(best_1["n_components_osc"],
-                                         margin=2, min_val=1)
-        n_cands   = make_fine_candidates(best_1["n_components"],
-                                         margin=4, min_val=2)
-        print(f"  osc候補:    {osc_cands}")
-        print(f"  n_comp候補: {n_cands}")
-        best_2, _ = search_best_params_with_osc(
-            X_raw, y, groups, spec_cols,
-            n_comp_candidates=n_cands,
-            n_comp_osc_candidates=osc_cands,
-            n_splits=5, scaler=scaler,
-            ref_spectrum=ref, deriv=0
-        )
+    search_log = []
+    best_rmse  = np.inf
+    best_cfg   = None
 
-        best_n_osc = best_2["n_components_osc"]
-        best_n     = best_2["n_components"]
+    for i, cand in enumerate(top_candidates, 1):
+        prep_cfg = cand["preprocessing"]
+        print(f"\n[{i}/{n_top}] 前処理: {prep_cfg}")
 
-        # 詳細CV
-        if scaler == "snv":
-            X_scaled = apply_snv(X_raw)
-        else:
-            X_scaled = apply_msc(X_raw, ref_spectrum)
+        best_params, cv_rmse = _optuna_tune(
+            X_raw, y, groups, prep_cfg, ref_spectrum,
+            n_trials=n_trials, n_splits=n_splits, use_log_y=use_log_y)
 
-        gkf = GroupKFold(n_splits=5)
-        fold_results = []
-        for fold_idx, (tr_idx, val_idx) in enumerate(
-                gkf.split(X_scaled, y, groups=groups)):
-            X_tr, X_val = X_scaled[tr_idx], X_scaled[val_idx]
-            y_tr, y_val = y[tr_idx], y[val_idx]
-            groups_val  = groups[val_idx]
+        # early_stopping の平均 best_iteration を取得するため CV を再実行
+        model_cfg = {"model_type": "lgbm", "params": best_params}
+        _, fold_results = cross_validate(
+            X_raw, y, groups, prep_cfg, model_cfg,
+            ref_spectrum, n_splits, use_log_y)
+        avg_iter = int(np.mean([
+            r["best_iteration"] for r in fold_results
+            if "best_iteration" in r
+        ] or [best_params["n_estimators"]]))
 
-            osc_params_fold = fit_osc(X_tr, y_tr, n_components=best_n_osc)
-            X_tr_osc  = apply_osc(X_tr,  osc_params_fold)
-            X_val_osc = apply_osc(X_val, osc_params_fold)
+        # 最終モデルは early stopping の平均イテレーションを n_estimators に使う
+        final_params = {**best_params, "n_estimators": avg_iter}
+        model_cfg_final = {"model_type": "lgbm", "params": final_params}
 
-            pls = PLSRegression(n_components=best_n, scale=False)
-            pls.fit(X_tr_osc, y_tr)
-            y_pred = np.clip(pls.predict(X_val_osc).flatten(), 0, None)
-
-            fold_rmse    = rmse(y_val, y_pred)
-            species_rmse = {}
-            for sp in np.unique(groups_val):
-                mask = groups_val == sp
-                species_rmse[int(sp)] = rmse(y_val[mask], y_pred[mask])
-            fold_results.append({
-                "fold": fold_idx + 1, "rmse": fold_rmse,
-                "n_valid": len(y_val), "species_rmse": species_rmse,
-            })
-
-        cv_rmse = np.mean([r["rmse"] for r in fold_results])
-        print(f"\nrun_{run_id}: {scaler.upper()} + OSC, "
-              f"osc={best_n_osc}, n_comp={best_n}, CV-RMSE={cv_rmse:.4f}")
-        print_cv_detail(fold_results, train)
-
-        results_summary.append({
-            "run_id": run_id, "scaler": scaler, "deriv": 0,
-            "use_osc": True, "use_log_y": False,
-            "window_length": None, "n_components_osc": best_n_osc,
-            "n_components": best_n, "cv_rmse": cv_rmse,
+        search_log.append({
+            "rank": i, "cv_rmse": cv_rmse,
+            "preprocessing": prep_cfg,
+            "model": model_cfg_final,
+            "avg_iter": avg_iter,
         })
 
-    # --- 全実験の比較 ---
-    CURRENT_BEST_RMSE = 24.5375
-    CURRENT_BEST_RUN  = "014"
+        if cv_rmse < best_rmse:
+            best_rmse = cv_rmse
+            best_cfg  = {"preprocessing": prep_cfg, "model": model_cfg_final,
+                         "cv_rmse": cv_rmse}
 
-    print(f"\n{'='*75}")
-    print("全実験の比較（既存結果も含む）")
-    print(f"{'='*75}")
-    print(f"{'run_id':>8}  {'scaler':>6}  {'deriv':>6}  {'osc':>5}  "
-          f"{'window':>8}  {'n_osc':>6}  {'n_comp':>8}  {'CV-RMSE':>10}")
-    print(f"{'-'*70}")
-    print(f"{'014':>8}  {'snv':>6}  {'2':>6}  {'yes':>5}  "
-          f"{'13':>8}  {'2':>6}  {'23':>8}  "
-          f"{CURRENT_BEST_RMSE:>10.4f}  <- 既存ベスト")
-    for r in results_summary:
-        w_str   = str(r["window_length"])   if r["window_length"]   else "-"
-        osc_str = str(r["n_components_osc"]) if r["n_components_osc"] else "-"
-        osc_label = "yes" if r["use_osc"] else "no"
-        print(f"{r['run_id']:>8}  {r['scaler']:>6}  {r['deriv']:>6}  "
-              f"{osc_label:>5}  {w_str:>8}  {osc_str:>6}  "
-              f"{r['n_components']:>8}  {r['cv_rmse']:>10.4f}")
+    search_log.sort(key=lambda x: x["cv_rmse"])
+    for rank, e in enumerate(search_log, 1):
+        e["rank"] = rank
 
-    # --- 最良の設定でモデルを保存 ---
-    best_run = min(results_summary, key=lambda x: x["cv_rmse"])
-    if best_run["cv_rmse"] < CURRENT_BEST_RMSE:
-        print(f"\n-> run_{best_run['run_id']}が最良 "
-              f"(CV-RMSE={best_run['cv_rmse']:.4f})")
+    print(f"\nPhase 2 最良: CV-RMSE={best_rmse:.4f}")
+    return best_cfg, search_log
 
-        if best_run["scaler"] == "snv":
-            X_scaled = apply_snv(X_raw)
-        else:
-            X_scaled = apply_msc(X_raw, ref_spectrum)
 
-        X_diff = apply_savgol(X_scaled,
-                              window_length=best_run["window_length"],
-                              deriv=best_run["deriv"])             if best_run["deriv"] > 0 else X_scaled
+# ============================================================
+# 最終モデルの学習・保存
+# ============================================================
 
-        if best_run["use_osc"]:
-            osc_params = fit_osc(X_diff, y,
-                                 n_components=best_run["n_components_osc"])
-            X_save = apply_osc(X_diff, osc_params)
-            joblib.dump(osc_params, "models/osc_params.pkl")
-            print("[main] OSCパラメータを保存: models/osc_params.pkl")
-        else:
-            X_save = X_diff
+def train_final_model(X_raw: np.ndarray,
+                      y: np.ndarray,
+                      prep_cfg: dict,
+                      model_cfg: dict,
+                      ref_spectrum: np.ndarray,
+                      use_log_y: bool = False,
+                      save_dir: str = "models") -> dict:
+    """
+    最良設定で全 train を使ってモデルを学習し保存する。
 
-        train_final_model(
-            X_save, y, best_run["n_components"],
-            save_path="models/pls_model.pkl"
-        )
-        if best_run["scaler"] == "msc":
-            joblib.dump(ref_spectrum, "models/ref_spectrum.pkl")
-            print("[main] MSC基準スペクトルを保存: models/ref_spectrum.pkl")
-        joblib.dump(best_run, "models/best_params.pkl")
-        print(f"[main] 最良設定を保存: models/best_params.pkl")
+    保存ファイル:
+        model.pkl        学習済みモデル
+        prep_params.pkl  前処理パラメータ（OSC/PCA）
+        ref_spectrum.pkl MSC 用基準スペクトル
+        config.json      設定（再現用）
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    X, saved_params = build_pipeline(
+        X_raw, y, prep_cfg, ref_spectrum, fit_mode=True)
+    y_fit = apply_log_y(y) if use_log_y else y
+
+    model_type = model_cfg["model_type"]
+    params     = model_cfg.get("params", {})
+
+    if model_type == "pls":
+        model = PLSRegression(n_components=params.get("n_components", 10),
+                              scale=False)
+        model.fit(X, y_fit)
+
+    elif model_type == "lgbm":
+        import lightgbm as lgb
+        p = {**params, "verbose": -1}
+        p.setdefault("random_state", 42)
+        model = lgb.LGBMRegressor(**p)
+        model.fit(X, y_fit)
+
+    elif model_type == "ridge":
+        from sklearn.linear_model import Ridge
+        model = Ridge(alpha=params.get("alpha", 1.0))
+        model.fit(X, y_fit)
+
+    elif model_type == "svr":
+        from sklearn.svm import SVR
+        from sklearn.preprocessing import StandardScaler
+        sc = StandardScaler()
+        X_sc = sc.fit_transform(X)
+        inner = SVR(C=params.get("C", 1.0),
+                    epsilon=params.get("epsilon", 0.1),
+                    kernel=params.get("kernel", "rbf"),
+                    gamma=params.get("gamma", "scale"))
+        inner.fit(X_sc, y_fit)
+        model = (sc, inner)
+
     else:
-        print(f"\n-> run_{CURRENT_BEST_RUN}が依然として最良 "
-              f"(CV-RMSE={CURRENT_BEST_RMSE})")
-        print("  モデルの更新は不要です")
+        raise ValueError(f"未対応のモデル: {model_type}")
 
-    print("\n学習モジュール: 正常終了")
+    paths = {
+        "model":        os.path.join(save_dir, "model.pkl"),
+        "prep_params":  os.path.join(save_dir, "prep_params.pkl"),
+        "ref_spectrum": os.path.join(save_dir, "ref_spectrum.pkl"),
+        "config":       os.path.join(save_dir, "config.json"),
+    }
+    joblib.dump(model,        paths["model"])
+    joblib.dump(saved_params, paths["prep_params"])
+    joblib.dump(ref_spectrum, paths["ref_spectrum"])
+    with open(paths["config"], "w", encoding="utf-8") as f:
+        json.dump({"preprocessing": prep_cfg, "model": model_cfg,
+                   "use_log_y": use_log_y}, f, ensure_ascii=False, indent=2)
+
+    print(f"\n[train_final_model] 保存完了: {save_dir}")
+    for k, v in paths.items():
+        print(f"  {k:<14}: {v}")
+    return paths
+
+
+# ============================================================
+# CV 結果の詳細表示
+# ============================================================
+
+def print_cv_detail(fold_results: list[dict], train_df: pd.DataFrame):
+    """樹種ごとの CV-RMSE を表示する。"""
+    sp_name_map = dict(zip(
+        train_df["species_number"].astype(str), train_df["species_name"]))
+
+    print(f"\n{'='*55}")
+    print("樹種ごとの CV-RMSE")
+    print(f"{'='*55}")
+    print(f"{'樹種':>6}  {'樹種名':<12}  {'RMSE':>8}  {'fold数':>6}")
+    print(f"{'-'*40}")
+
+    sp_rmse_all: dict[str, list] = {}
+    for fold in fold_results:
+        for sp, r in fold["species_rmse"].items():
+            sp_rmse_all.setdefault(str(sp), []).append(r)
+
+    for sp in sorted(sp_rmse_all.keys(), key=lambda x: int(x)):
+        mean_r = float(np.mean(sp_rmse_all[sp]))
+        print(f"{sp:>6}  {sp_name_map.get(sp, '不明'):<12}  "
+              f"{mean_r:>8.4f}  {len(sp_rmse_all[sp]):>6}")
+
+
+# ============================================================
+# 実験結果一覧表示
+# ============================================================
+
+def show_results(model_dir: str = "models", top: int = 20):
+    """models/ 以下の全実験の CV-RMSE を昇順で表示する。"""
+    model_path = Path(model_dir)
+    if not model_path.exists():
+        print(f"[ERROR] {model_dir} が存在しません")
+        return
+
+    results = []
+    for run_dir in sorted(model_path.iterdir()):
+        summary_path = run_dir / "summary.json"
+        if not summary_path.exists():
+            continue
+        with open(summary_path, encoding="utf-8") as f:
+            s = json.load(f)
+        prep = s.get("best_cfg", {}).get("preprocessing", {})
+        results.append({
+            "run_id":  s.get("run_id", run_dir.name),
+            "cv_rmse": s.get("cv_rmse", float("inf")),
+            "model":   s.get("best_cfg", {}).get("model", {}).get("model_type", "?"),
+            "scaler":  prep.get("scaler", "-"),
+            "deriv":   prep.get("deriv", "-"),
+            "window":  prep.get("window", "-"),
+            "osc":     "yes" if prep.get("use_osc") else "no",
+            "pca":     "yes" if prep.get("use_pca") else "no",
+            "log_y":   "yes" if s.get("use_log_y") else "no",
+        })
+
+    if not results:
+        print("実験結果が見つかりませんでした。")
+        return
+
+    results.sort(key=lambda x: x["cv_rmse"])
+    print(f"\n{'='*85}")
+    print(f"実験結果サマリー（CV-RMSE 昇順、上位 {top} 件）")
+    print(f"{'='*85}")
+    print(f"{'run_id':<35}  {'model':<6}  {'scaler':<5}  "
+          f"{'deriv':>5}  {'win':>4}  {'osc':>4}  {'pca':>4}  "
+          f"{'logy':>4}  {'CV-RMSE':>10}")
+    print(f"{'-'*85}")
+    for r in results[:top]:
+        print(f"{r['run_id']:<35}  {r['model']:<6}  {str(r['scaler']):<5}  "
+              f"{str(r['deriv']):>5}  {str(r['window']):>4}  "
+              f"{r['osc']:>4}  {r['pca']:>4}  {r['log_y']:>4}  "
+              f"{r['cv_rmse']:>10.4f}")
+    print(f"\n現時点の最良: {results[0]['run_id']}  "
+          f"CV-RMSE={results[0]['cv_rmse']:.4f}")
+
+
+# ============================================================
+# エントリーポイント
+# ============================================================
+
+def run_from_config(config_path: str,
+                    optimizer: str = "grid",
+                    n_trials: int = 100,
+                    n_top: int = 3):
+    """
+    config YAML を読み込んで実験を実行し、最終モデルを保存する。
+
+    Parameters
+    ----------
+    optimizer : "grid" | "optuna"
+        grid  → グリッドサーチのみ
+        optuna → グリッドサーチ（前処理絞り込み）→ Optuna（LightGBM 専用）
+    n_trials  : Optuna の試行回数（optimizer="optuna" のとき有効）
+    n_top     : Optuna をかける上位候補数（同上）
+    """
+    with open(config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    run_id   = cfg.get("run_id", Path(config_path).stem)
+    save_dir = os.path.join(cfg.get("model_dir", "models"), run_id)
+    os.makedirs(save_dir, exist_ok=True)
+
+    train_df, _, _, spec_cols = load_data(cfg.get("data_dir", "data/"))
+    X_raw    = train_df[spec_cols].values
+    y        = train_df["moisture_content"].values
+    groups   = train_df["species_number"].values
+    ref_spec = fit_msc(X_raw)
+
+    use_log_y = cfg.get("cv", {}).get("use_log_y", False)
+    n_splits  = cfg.get("cv", {}).get("n_splits", 5)
+
+    # --- 探索 ---
+    if optimizer == "optuna":
+        best_cfg, search_log = optuna_search(
+            X_raw, y, groups, cfg, ref_spec,
+            n_trials=n_trials, n_top=n_top)
+    else:
+        best_cfg, search_log = grid_search(
+            X_raw, y, groups, cfg, ref_spec)
+
+    # 探索ログ保存（fold_results は除外してサイズを抑える）
+    log_slim = [{k: v for k, v in e.items() if k != "fold_results"}
+                for e in search_log]
+    search_log_path = os.path.join(save_dir, "search_log.json")
+    with open(search_log_path, "w", encoding="utf-8") as f:
+        json.dump(log_slim, f, ensure_ascii=False, indent=2)
+    print(f"\n探索ログ保存: {search_log_path}")
+
+    # --- 最良設定で詳細 CV ---
+    print(f"\n{'='*55}")
+    print("最良設定の詳細 CV 結果")
+    print(f"{'='*55}")
+    cv_rmse, fold_results = cross_validate(
+        X_raw, y, groups,
+        best_cfg["preprocessing"], best_cfg["model"],
+        ref_spec, n_splits, use_log_y)
+    print_cv_detail(fold_results, train_df)
+
+    # --- 最終モデル学習・保存 ---
+    print(f"\n{'='*55}")
+    print("全 train データで最終モデルを学習")
+    print(f"{'='*55}")
+    artifacts = train_final_model(
+        X_raw, y,
+        best_cfg["preprocessing"], best_cfg["model"],
+        ref_spec, use_log_y, save_dir)
+
+    # サマリー保存
+    summary = {
+        "run_id": run_id, "config_path": str(config_path),
+        "cv_rmse": cv_rmse, "best_cfg": best_cfg,
+        "use_log_y": use_log_y, "artifacts": artifacts,
+    }
+    summary_path = os.path.join(save_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"\nサマリー保存: {summary_path}")
+    print(f"\n{'='*55}")
+    print(f"run_id={run_id}  最終 CV-RMSE={cv_rmse:.4f}")
+    print(f"{'='*55}")
+    return summary
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="近赤外スペクトル分析チャレンジ — 学習スクリプト")
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="実験設定 YAML ファイルのパス")
+    parser.add_argument(
+        "--optimizer", type=str, default="grid",
+        choices=["grid", "optuna"],
+        help="探索方法: grid（デフォルト）| optuna（LightGBM 専用）")
+    parser.add_argument(
+        "--n_trials", type=int, default=100,
+        help="Optuna の試行回数（--optimizer optuna のとき有効、デフォルト 100）")
+    parser.add_argument(
+        "--n_top", type=int, default=3,
+        help="Optuna をかける上位候補数（同上、デフォルト 3）")
+    parser.add_argument(
+        "--show", action="store_true",
+        help="models/ 以下の実験結果を一覧表示して終了")
+    parser.add_argument(
+        "--model_dir", type=str, default="models",
+        help="--show のときに参照するディレクトリ（デフォルト: models）")
+    args = parser.parse_args()
+
+    if args.show:
+        show_results(args.model_dir)
+    elif args.config:
+        run_from_config(args.config, args.optimizer, args.n_trials, args.n_top)
+    else:
+        parser.print_help()

@@ -1,166 +1,161 @@
-# 近赤外研究会 スペクトル分析チャレンジ
+# 近赤外研究会 スペクトル分析チャレンジ — 実験ガイド
 
-SIGNATE開催コンペ「近赤外スペクトルから木材の含水率を予測する」の取り組みリポジトリです。
-
----
-
-## 課題概要
-
-| 項目 | 内容 |
-|---|---|
-| タスク | 近赤外スペクトルデータから木材の含水率（%）を回帰予測 |
-| 評価指標 | RMSE（小さいほど良い） |
-| 学習データ | 1,322サンプル × 1,555波数（13樹種） |
-| テストデータ | 550サンプル × 1,555波数（6樹種） |
-| 特記事項 | **trainとtestで樹種が完全に分離**（未知樹種への汎化が必須） |
-| 最終締切 | 2026年6月30日 23:59 |
-
----
-
-## このコンペの難しさ
-
-通常の回帰タスクと異なり、学習データとテストデータで樹種が1種類も重複していません。「学習に使っていない樹種のスペクトルから含水率を予測する」という汎化性能が問われる設計になっています。そのため、樹種番号を特徴量として直接使うことは逆効果になります。
-
----
-
-## ファイル構成
+## プロジェクト構成
 
 ```
-プロジェクトフォルダ/
-│
-├── README.md                   # このファイル
-│
-├── data/                       # データ（Git管理外推奨）
-│   ├── train.csv               # 学習データ（Shift-JIS）
-│   ├── test.csv                # テストデータ（Shift-JIS）
-│   └── sample_submit.csv       # 提出フォーマットのサンプル
-│
-├── eda_nirs.ipynb              # 探索的データ分析（EDA）
-├── preprocessing.ipynb         # 前処理パイプライン
-├── learning.ipynb              # モデル学習 v1（ベースライン）
-├── predicting.ipynb            # 予測・提出ファイル生成 v1
-├── learning_v2.ipynb           # モデル学習 v2（類似度特徴量あり）
-├── predicting_v2.ipynb         # 予測・提出ファイル生成 v2
-│
-├── models/                     # 学習済みオブジェクトの保存先
-│   ├── pca.pkl                 # 学習済みPCA（testへの適用に使用）
-│   ├── X_train.npy             # 前処理済みtrain特徴量
-│   ├── y_train.npy             # log変換済みtrain目的変数
-│   ├── X_test.npy              # 前処理済みtest特徴量
-│   ├── test_sample_numbers.npy # testのsample_number
-│   ├── model.pkl               # 学習済みモデル v1
-│   ├── model_v2.pkl            # 学習済みモデル v2（類似度特徴量あり）
-│   ├── species_centroids.npy   # train各樹種の平均スペクトル（v2用）
-│   └── species_centroid_ids.npy# 樹種番号の対応表（v2用）
-│
-└── submission.csv              # 提出ファイル（最新）
+.
+├── data/
+│   ├── train.csv
+│   ├── test.csv
+│   └── sample_submit.csv
+├── models/
+│   └── <run_id>/               # 実験ごとに自動生成
+│       ├── model.pkl           # 学習済みモデル
+│       ├── prep_params.pkl     # 前処理パラメータ（OSC/PCA）
+│       ├── ref_spectrum.pkl    # MSC 用基準スペクトル
+│       ├── config.json         # この実験の設定（再現用）
+│       ├── search_log.json     # グリッドサーチの全結果
+│       └── summary.json        # 最良パラメータと CV-RMSE
+├── configs/
+├── src/
+│   ├── __init__.py
+│   ├── preprocessing.py   # 前処理（SNV/MSC/OSC/PCA/SavGol）
+│   ├── learning.py        # 学習・グリッドサーチ・Optuna・結果一覧
+│   └── predicting.py      # 予測・提出ファイル生成
+├── pyproject.toml
+└── submission.csv         # 最新の提出ファイル
 ```
 
 ---
 
-## 実行手順
-
-Notebookを以下の順番で上から順に実行してください。
-
-### 1. EDA（任意・参考用）
-
-```
-eda_nirs.ipynb
-```
-
-データの分布・スペクトルの可視化・含水率との相関分析を行います。モデル設計の根拠を確認したい場合に参照してください。
-
-### 2. 前処理（v1・v2 共通）
-
-```
-preprocessing.ipynb
-```
-
-以下の前処理を順番に適用し、`models/` フォルダに保存します。
-
-| ステップ | 内容 | 理由 |
-|---|---|---|
-| SNV | 各サンプルを平均0・標準偏差1に正規化 | 樹種・測定条件の違いによるベースラインずれを除去 |
-| PCA | 1555次元 → 20次元に削減 | 高次元・高相関な特徴量を圧縮（累積寄与率99.92%） |
-| log変換 | 含水率を `log(1 + x)` に変換 | 分布の右への偏り（歪度1.65）を補正 |
-
-**重要**: PCAは必ずtrainデータだけで学習（`fit`）し、testには同じ変換を適用（`transform`）します。testで`fit`するとデータリークになります。
-
-### 3a. モデル学習 v1（ベースライン）
-
-```
-learning.ipynb → predicting.ipynb
-```
-
-Ridge回帰をGroupKFold（**ベイスギ除外CV**）でバリデーションしながらalphaを探索し、最良のモデルをtrain全データで再学習して保存します。
-
-### 3b. モデル学習 v2（類似度特徴量あり）
-
-```
-learning_v2.ipynb → predicting_v2.ipynb
-```
-
-v1に加えて、trainの各樹種平均スペクトルとのユークリッド距離（13次元）を特徴量に追加します。PCA20次元 + 類似度13次元の計33次元でRidgeを学習します。
-
-**なぜ有効か**：testは未知樹種だが「trainのどの樹種に似ているか」という文脈情報を与えることで、似た樹種の傾向を参考にしながら予測できるようになるため。
-
-**ルール適合性**：基準点はtrainだけから作るので、testサンプル同士の情報は使わない。
-
----
-
-## CVの評価方針
-
-### ベイスギ（樹種15）をCVから除外する理由
-
-PCA分析により、ベイスギのスペクトルは他の全樹種と大きく異なることが判明しました（PCA第1主成分が+9.7と突出）。一方、testの6樹種は全てPC1が-2〜0の範囲に収まっており、ベイスギのような外れた位置にいません。
-
-ベイスギを含めたCVはスコアが悪く見えすぎて改善の判断精度が下がるため、**CVはベイスギ除外・最終学習は全樹種込み**の方針を採用しています。
-
-| CV方針 | ベイスギ |
-|---|---|
-| CVスコアの計算（改善判断） | 除外する |
-| 最終モデルの学習 | 含める |
-
----
-
-## 提出履歴
-
-| # | モデル | 前処理 | CV RMSE（ベイスギ除外） | public RMSE |
-|---|---|---|---|---|
-| 1 | Ridge（alpha=2000） | SNV + PCA 20次元 | - | 14.75 |
-| 2 | Ridge（alpha=2500） | SNV + PCA 20次元 | 19.00 ± 7.51 | 14.40 |
-| 3 | Ridge（alpha=1600） | SNV + PCA 20次元 | 18.52 ± 6.12 | 15.16 |
-| 4 | Ridge（alpha=1100） | SNV + PCA 20次元 + 類似度13次元 | 17.84 ± 6.29 | 17.64 |
-
----
-
-## EDAで判明した主な知見
-
-- 含水率は右に強く偏っている（歪度1.65、最大値298%）→ log変換で対応
-- 樹種ごとに含水率の範囲が大きく異なる（種3の平均15%、種15の平均88%）
-- 7600 cm⁻¹付近の波数が含水率と最も相関が高い（r=0.78）→ 水のO-H伸縮振動の倍音帯
-- スペクトルのベースラインが樹種間でずれている → SNVで対応
-- **trainとtestで樹種が完全に分離** → 樹種番号を特徴量に使わない設計が必須
-- **ベイスギ（樹種15）のスペクトルが突出して特殊**（PC1=+9.7）→ CVから除外して評価精度を改善
-
----
-
-## 今後の改善方針
-
-1. **類似度特徴量の深掘り**：最近傍サンプルとの距離など類似度の種類を増やす
-2. **モデルのアップグレード**：LightGBMなど非線形モデルへの切り替えを検討
-3. **水分吸収帯への特化**：5200cm⁻¹・7000cm⁻¹付近に絞った特徴量設計
-4. **アンサンブル**：複数モデルの予測を組み合わせる（最終手段）
-
----
-
-## 環境
-
-- Python 3.10
-- pandas, numpy, matplotlib, seaborn, scipy
-- scikit-learn（Ridge, PCA, GroupKFold）
-- joblib
+## セットアップ
 
 ```bash
-pip install pandas numpy matplotlib seaborn scikit-learn joblib scipy
+uv sync
 ```
+
+スクリプトの実行はすべて `uv run` を使う。
+
+---
+
+## 基本的な実験の流れ
+
+### 1. グリッドサーチ → 最終モデル保存
+
+```bash
+# ベースライン（PLS × SNV + 2次微分）
+uv run python src/learning.py --config configs/pls_snv_deriv2.yaml
+
+# PLS × MSC + 2次微分 + OSC
+uv run python src/learning.py --config configs/pls_msc_deriv2_osc.yaml
+
+# LightGBM の前処理スクリーニング
+uv run python src/learning.py --config configs/lgbm_snv_pca.yaml
+```
+
+実行すると `models/<run_id>/` 以下に以下が生成される：
+
+| ファイル | 内容 |
+|---|---|
+| `search_log.json` | 全組み合わせの CV-RMSE |
+| `summary.json` | 最良設定と CV-RMSE |
+| `model.pkl` | 最良設定で学習したモデル |
+| `prep_params.pkl` | 前処理パラメータ（OSC/PCA） |
+| `ref_spectrum.pkl` | MSC 用基準スペクトル |
+| `config.json` | 設定（再現用） |
+
+### 2. LightGBM の Optuna チューニング
+
+グリッドサーチで前処理を絞り込んだ後、上位 N 候補に対して Optuna でハイパーパラメータを最適化する。
+
+```bash
+uv run python src/learning.py --config configs/lgbm_snv_pca.yaml \
+                               --optimizer optuna --n_trials 100 --n_top 3
+```
+
+### 3. 実験結果の比較
+
+```bash
+uv run python src/learning.py --show
+```
+
+### 4. 提出ファイルの生成
+
+```bash
+# 単一モデル
+uv run python src/predicting.py --run_id pls_snv_deriv2
+
+# アンサンブル（複数モデルの平均）
+uv run python src/predicting.py --run_id pls_snv_deriv2 lgbm_snv_pca --ensemble mean
+```
+
+---
+
+## config YAML の書き方
+
+```yaml
+run_id: my_experiment    # models/<run_id>/ に結果を保存
+model_dir: models
+data_dir: data/
+
+cv:
+  n_splits: 5
+  use_log_y: false       # true にすると含水率を log1p 変換して学習
+
+preprocessing:           # 固定設定（search_params で上書きされる）
+  scaler: snv            # "snv" | "msc" | null
+  deriv: 2               # 0=なし / 1=1次微分 / 2=2次微分
+  window: 13             # Savitzky-Golay の window 長
+  polyorder: 2
+  use_osc: false
+  n_components_osc: 2    # use_osc: true のとき有効
+  use_pca: false
+  n_components_pca: 50   # use_pca: true のとき有効
+
+model:
+  model_type: pls        # "pls" | "lgbm" | "ridge" | "svr"
+  params:
+    n_components: 20
+
+search_params:           # ここのリストが総当たりで探索される
+  preprocessing:
+    window: [9, 11, 13, 15]
+  model:
+    n_components: [10, 15, 20, 25, 30]
+```
+
+**`search_params` のポイント：**
+- `preprocessing` / `model` 以下のキーにリストを書くと総当たりで展開される
+- リストのないキーは固定設定として維持される
+- `{}` を指定するとグリッドサーチなし（CV を 1 回だけ実行）
+
+### Claude に config を書かせる場合
+
+実験アイデアを伝えれば YAML を生成してもらえる。
+
+> 「MSC + 1次微分 + OSCなし で PLS を試したい。
+> window を [5, 7, 9, 11]、成分数を [10, 15, 20, 25] で探索してほしい。」
+
+---
+
+## 実験戦略メモ（提出回数: チーム全体で 5 回/日）
+
+### フェーズ 1: PLS の基本探索
+- [ ] `pls_snv_deriv2.yaml`
+- [ ] `pls_msc_deriv2_osc.yaml`
+
+### フェーズ 2: LightGBM の前処理スクリーニング
+- [ ] `lgbm_snv_pca.yaml`
+
+### フェーズ 3: Optuna チューニング
+- [ ] `--optimizer optuna` で上位候補をチューニング
+
+### フェーズ 4: アンサンブル
+- [ ] PLS 最良 × LightGBM 最良のアンサンブルを試す
+
+---
+
+## 注意事項
+
+- CV-RMSE が改善した場合のみ提出する（`--show` で比較してから判断）
+- test.csv の樹種は train.csv と異なるため GroupKFold（樹種単位の分割）を必ず使う
